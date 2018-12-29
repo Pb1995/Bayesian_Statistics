@@ -1,0 +1,1364 @@
+---
+title: "Ideal Point Models with Twitter data"
+author: "Andrés Castro Araújo, Pranjal Bajaj, Hyun Mean Park"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    theme: lumen
+    toc: yes
+    toc_float: 
+      collapsed: no
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center", cache = TRUE)
+
+## Packages
+library(tidyverse)
+library(Matrix)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+library(bayesplot)
+bayesplot_theme_set(theme_classic(base_family = "Avenir"))
+color_scheme_set("viridis")
+
+## Extra functions
+plot_settings <- function() {
+  par(mar = c(3, 3, 3, 1), mgp = c(2, 0.5, 0), tck = -0.02, 
+    family = "Avenir", cex = 0.8, pch = 20)
+}
+```
+
+## Introduction
+
+****
+
+### Background
+
+****
+
+This model is similar to classic *ideal-point models* (e.g. Clinton et al 2004; Bafumi et al 2005) that measure "ideology" and *latent space models* of social network data (e.g. Hoff et al 2002) that measure "homophily". It was first developed by Barberá (2015): "Birds of the same feather tweet together: Bayesian ideal point estimation using Twitter data" in *Political Analysis.*
+
+In other words, the idea is to use the social network formed between citizens and political actors in Twitter as a *source of information* about each other's ideological positions.
+
+The original model uses a huge adjacency matrix in which the rows are Twitter users who decide to follow a politician based on four parameters:
+
+1. The "popularity" or "high profile" of the politician.
+
+2. The "level of political interest" of the user (e.g. how many politicians is she willing to follow on Twitter).
+
+3. And two parameters that are taken to be the ideological preference for ordinary Twitter users and politicians.
+
+His Stan program is as follows:
+
+```{r, comment=""}
+readLines("stan/barbera.stan") %>% 
+  writeLines()
+```
+
+However, this original model takes around 20 hours to fit and none of us was able to make it work on our computers. To get around this issue, we modify the original data in order to reduce the amount of parameters that need to be estimated. 
+
+Here's the problem: Barberá's original dataset consists of an adjacency matrix with 301,537 rows (or regular Twitter users) and 318 columns (or political actors). Each cell is $y_{ij} \in \{1, 0\}$, indicating whether a specific user follows a specific politician $j$ or not.
+
+```{r}
+load("data/barberá_replication_set/adj-matrix-US.rdata")
+```
+
+```{r}
+y@Dim
+nnzero(y) / prod(y@Dim)
+```
+
+This means the original model estimates 603,074 parameters for the users and 636 parameters for the politicians, from a very sparse matrix (approx 97% of all entries are zero).
+
+Our approach is different. We take the following matrix projections:
+
+$$
+\begin{align}
+&\mathbf{A^\top A} = \text{politician } \times \text{ politician matrix} \\\\
+&\mathbf{A A^\top} = \text{user } \times \text{ user matrix}
+\end{align}
+$$
+
+The $\mathbf A = \mathbf{Y^\top Y}$ transformation is a symmetric $318 \times 318$ matrix in which each entry in the diagonal corresponds to each politicians (in-sample) total follower. Note the following:
+
+$$
+\textsf{diag}(\mathbf{A^\top A}) = \textsf{colSums}(\mathbf A)
+$$
+
+Each cell $w_{ij} = w_{ji}$ is now the number of mutual followers between politician $i$ and politician $j$. Similarly, the cells in the "user-user matrix" correspond to the amount of politicians by which each user is connected.
+
+$$
+\textsf{diag}(\mathbf{A A^\top}) = \textsf{rowSums}(\mathbf A)
+$$
+
+Throughout, we focus on the politician matrix, but note that the same model can be applied to the user matrix (with a different interpretation for the values in the diagonal).
+
+****
+
+### The model
+
+****
+
+Our initial model for the data is as follows:
+
+$$
+\begin{align}
+&w_{ij} \sim \textsf{binomial}(\min(n_i, n_j), p_{ij}) \\\\
+&p_{ij} = \textsf{logit}^{-1}(\alpha_i + \alpha_j - \textsf{dist}(\theta_i, \theta_j)) \\\\
+&\textsf{dist}(\theta_i, \theta_j) = | \theta_i - \theta_j|
+\end{align}
+$$
+
+Because the matrix is symmetric, we have that $w_{ij} = w_{ji}$ and that $p_{ij} = p_{ji}$. We define $u \to i$ to indicate that a regular Twitter user follos politician $i$. If we understand our own model correctly, then these conditional probabilities should be equal:
+
+$$
+\Pr(u \to i \mid u \to j, \alpha_i, \alpha_j, \theta_i, \theta_j) = \Pr(u \to j \mid u \to i, \alpha_i, \alpha_j, \theta_i, \theta_j)
+$$
+
+This is reflected in the fact that the matrix is symmetric.
+
+The $\boldsymbol \alpha$ parameters represent each person's "popularity" (or "high profile"), which should be roughly proportional to their amount of followers (given by $\mathbf A$'s diagonal elements):
+
+$$
+\boldsymbol \alpha \propto \textsf{diag}(\mathbf A)
+$$
+
+The $\boldsymbol \theta$ parameters are ultimately what we're interested in. They represent each person's latent ideology: the closer two people are ideologically, the more mutual followers they will have (after adjusting for each one's popularity). This is why we use the function $\textsf{dist}(\theta_i, \theta_j)$, which is usually taken to be the Euclidean distance. 
+
+Finally, the $n$ parameter in the binomial likelihood is taken to be the smallest number of total followers between both politicians. This is because the amoung of mutual followers between $i$ and $j$ is logically bounded by the minimum of $i$ and $j$'s total followers. 
+
+Also, should we say that $i = j$, then $p_{ij} \approx 1$ and the expected number of mutual followers just corresponds to the diagonal in the adjacency matrix. At least, this *should* be the case (this is one of the ways we propose to expand to the model later on).
+
+****
+
+### Priors
+
+****
+
+Special priors are *needed* in this model because, as it stands, it is *unidentifiable*. It has three sources of unidentifiability.
+
+*Additive aliasing in popularity*: any constant $k$ can be added to $\alpha_i$ and then subtracted from $\alpha_j$, leaving the predictions unchanged.
+
+$$
+\alpha_i + \alpha_j = (\alpha_i + k) + (\alpha_j -k)
+$$
+
+  i. Solution: constrain the $\alpha$'s to sum to zero.
+    
+  ii. Solution: set a prior on the $\alpha$'s, as follows:
+    
+$$
+\boldsymbol \alpha \sim \textsf{normal}(0, 1)
+$$
+    
+2. *Additive aliasing in ideology*: any constant $k$ can be added to both $\theta_i$ and $\theta_k$, leaving predictions unchanged:
+
+$$
+\begin{align}
+\textsf{dist}(\theta_{i}, \theta_{j}) &=  \sqrt{(\theta_{id} - \theta_{jd})^2} \\\\ &= \sqrt{([\theta_{id} + k] - [\theta_{jd} + k])^2}
+\end{align}
+$$
+    
+i. Solution: constrain the $\theta$'s to sum to zero.
+    
+ii. Solution: set a prior on the $\theta$'s, as follows:
+    
+$$
+\boldsymbol \theta \sim \textsf{normal}(0, 1)
+$$
+
+*Reflection invariance in ideology*: all $\theta$'s could be multiplied by $-1$, leaving predictions unachanged:
+
+$$
+\textsf{dist}(\theta_{i}, \theta_{j}) = \textsf{dist}(-\theta_{i}, -\theta_{j})
+$$
+
+This will result in a bimodal likelihood and posterior distribution; and if we include both modes, then each parameter will have *two maximum likelihood estimates* and a *posterior mean of $0$*. 
+    
+To solve reflection invariance in Stan, we can do the following:
+
+**Solution 1**: restrict the sign of one of the $\theta$'s. For example, we get a renowned conservative politician and constrain his $\theta$ to be positive; this will ensure the polarity of the scale is in a direction that's both identifiable and easy to interpret.
+
+```
+parameters {
+  ...
+  real theta[J];
+  real<upper=0> renowned_left_person;
+  real<lower=0> renowned_right_person;
+}
+transformed parameters {
+  theta[location1] = renowned_left_person;
+  theta[location2] = renowned_right_person;
+}
+```
+
+Or maybe just using the following priors:
+
+```
+parameters {
+  ...
+  real theta[J];
+}
+model {
+  theta[1] ~ normal(-1, 1);
+  theta[2] ~ normal(1, 1);
+  for (i in 3:J) {
+    theta[i] ~ normal(0, 1)
+  }
+}
+```
+
+**Solution 2:** after estimating the model --with the bimodal distribution-- multiply the sampled $\theta$'s whenever they're not in the desired direction This can be done in the generated quantities block, which is calculated after each iteration: if $\theta_\text{right} < \theta_\text{left}$, then multiply $\theta$ times $-1$.
+
+**Solution 3:** Pick initial values in a clever way --Barberá did this, he picked differing initial values for each party-- and then passing them on to the `init` argument in the `stan()` or `sampling()` functions.
+
+**Solution 4:** An alternative to this solution is to put a different prior for each political party and take better advantage of the multilevel structure of the data. This is what Michael Betancourt ((here)[http://mc-stan.org/users/documentation/case-studies/identifying_mixture_models.html]) calls "breaking the labeling degeneracy with non-exchangeable priors". A similar solution involves using Stan's `ordered` type to impose order in the parameters.
+
+****
+
+### More about data
+
+****
+
+- The `total_followers` each politician has are distributed with a very long tail.
+
+- The same happens, to a lesser extent, with the amount of `mutual_followers`.
+
+```{r}
+A <- t(y) %*% y
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+A <- as.matrix(A)
+data_frame(total_followers = diag(A)) %>% 
+  ggplot(aes(x = total_followers)) +
+  geom_histogram(color = "black", fill = "pink", bins = 30) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_classic(base_family = "Avenir")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+data_frame(mutual_followers = A[upper.tri(A, diag = FALSE)]) %>% 
+  ggplot(aes(x = mutual_followers)) + 
+  geom_histogram(color = "black", fill = "pink", bins = 30) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_classic(base_family = "Avenir")
+
+data_frame(mutual_followers = A[upper.tri(A, diag = FALSE)]) %>% 
+  ggplot(aes(x = log(mutual_followers))) + 
+  geom_histogram(color = "black", fill = "pink", bins = 30) +
+  scale_x_continuous(labels = scales::comma) +
+  theme_classic(base_family = "Avenir")
+```
+
+The "Warning: Removed 15 rows containing non-finite values (stat_bin)" in the last graph indicates that 15 pairs of politicians have 0 mutual followers amongst themselves.
+
+In order to fit the data into Stan, we put the data into "long form", using the following code:
+
+```{r}
+as_long_form <- function(M) {
+  N <- sum(upper.tri(M, diag = FALSE))
+  output <- matrix(NA, ncol = 3, nrow = N)
+  k <- 1
+  for (i in 1:(ncol(M) - 1)) {
+    for (j in (i + 1):ncol(M)) {
+      output[k, 1:2] <- c(i, j)
+      output[k, 3] <- M[i, j]
+      k <- k + 1
+    }
+  }
+  colnames(output) <- c("ii", "jj", "W")
+  return(output)
+}
+
+df <- as_long_form(A) %>% as_tibble()
+df$name_ii <- colnames(A)[df$ii]
+df$name_jj <- colnames(A)[df$jj]
+```
+
+The transformed adjacency matrix looks like this:
+
+```{r}
+A[1:15, 1:6]
+```
+
+And the resulting data frame looks like this:
+
+```{r}
+df
+```
+
+****
+
+## Simulation
+
+**Simulate fake data and check that the model recovers the parameters.**
+
+****
+
+Data generating process for 20 politicians (10 from each party) and 10,000 users.
+
+- `K` is the number of politicians
+
+- `N` $= \binom{K}{2}$ is the total number of observations (assuming no missing data).
+
+- `theta` are the ideology parameters, assumed to come from bimodal distribution (i.e. we assume polarization); labels for each politician's `party` are also provided.
+
+- `total_followers` are the elements in the diagonal, they come from a positive $t$-student distribution, rounding up to the nearest integer.
+
+- `alpha` is a scaled down version of $\log$(`total_followers`), plus some random noise.
+
+```{r simulate_data}
+simulate_data <- function(K) {
+  N <- choose(K, 2)
+  theta <- c(rnorm(K/2, 1.5, 1), rnorm(K/2, -1.5, 1))  
+  total_followers <- round(abs(rt(K, df = 1)*1e4))
+  alpha <- as.vector(scale(log(total_followers))) + rnorm(K, sd = 0.2)
+  party <- c(rep("A", K/2), rep("B", K/2))
+  names(theta) <- party
+  theta <- sort(theta)
+  party <- names(theta)
+  invlogit <- function(x) 1 / (1 + exp(-x))   ## inverse logit
+  
+  output <- matrix(NA, ncol = K, nrow = K)    ## generate adj. matrix
+  for (i in 1:(ncol(output) - 1)) {
+    for (j in (i + 1):ncol(output)) {
+      p <- invlogit(alpha[i] + alpha[j] - abs(theta[i] - theta[j]))
+      output[i, j] <- rbinom(1, size = min(total_followers[i], total_followers[j]),
+                             prob = p)
+      output[j, i] <- output[i, j]
+      colnames(output) <- rownames(output) <- str_c("p", 1:K)
+    }
+  }
+  diag(output) <- total_followers
+  return(list(
+    A = output, 
+    pars = list(theta = theta, alpha = alpha),
+    party = party
+    ))
+}
+```
+
+And here are the results from one simulation (which look somewhat like the real data):
+
+```{r}
+set.seed(123)
+K <- 20
+simulation <- simulate_data(K)
+str(simulation)
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+ggplot(data_frame(total_followers = diag(simulation$A))) + 
+  geom_histogram(aes(x = total_followers), 
+                 color = "black", fill = "pink")
+
+data_frame(total_followers = diag(simulation$A), 
+           alpha = simulation$pars$alpha) %>%
+  ggplot(aes(x = log(total_followers), y = alpha)) +
+  geom_point()
+
+data_frame(theta = simulation$pars$theta, 
+           party = simulation$party) %>% 
+  ggplot(aes(x = theta, fill = party)) +
+  geom_density(alpha = 0.5)
+```
+
+Getting the data into long form, so they can be fed into Stan:
+
+```{r simulation_data}
+sim_long <- as_long_form(simulation$A) %>% as_tibble()
+min_n <- vector("double", nrow(sim_long))
+for (i in 1:nrow(sim_long)) {
+  min_n[[i]] <- min(diag(simulation$A)[sim_long$ii][i],
+                    diag(simulation$A)[sim_long$jj][i])
+}
+
+simulation_data <- list(
+  N = choose(K, 2),
+  K = K,
+  ii = sim_long$ii,
+  jj = sim_long$jj,
+  W = sim_long$W,
+  min_n = min_n
+)
+```
+
+****
+
+### Model 1
+
+**Fitting the model to the fake data**
+
+****
+
+*WARNING: this model doesn't deal with "reflection invariance" at all, so we expect it to perform poorly*
+
+```{r, comment=""}
+readLines("stan/model1.stan") %>% 
+  writeLines()
+```
+
+
+```{r, results="hide"}
+model1 <- stan_model("stan/model1.stan")
+```
+
+```{r, results="hide", eval=FALSE}
+fit_sim <- sampling(model1, data = simulation_data, 
+                    iter = 1000,
+                    seed = 123)
+saveRDS(fit_sim, "output/fit_sim.rds")
+```
+
+```{r}
+fit_sim <- readRDS("output/fit_sim.rds")
+```
+
+```{r, fig.height=2, fig.width=8, echo=FALSE}
+plot_settings()
+hist(summary(fit_sim)$summary[ , "Rhat"][1:30], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim)$summary[ , "Rhat"][31:61], main = "Rhat: alpha",
+     xlab = expression(alpha), breaks = 15)
+
+hist(summary(fit_sim)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+This model doesn't fit... which is no surprise because it doesn't consider "reflection invariance". The Rhat values are terrible, which indicates that the chains are not exploring the same regions of parameter space
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim), pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+mcmc_trace(as.array(fit_sim), pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+mcmc_trace(as.array(fit_sim), pars = "alpha[1]") +
+  geom_hline(yintercept = simulation$pars$alpha[1], 
+             linetype = "dashed", size = 1)
+mcmc_trace(as.array(fit_sim), pars = "alpha[10]") +
+  geom_hline(yintercept = simulation$pars$alpha[10], 
+             linetype = "dashed", size = 1)
+```
+
+In order to address this issue we take the simulated parameters of theta and choose one of the extreme values; we then nudge that parameter in a certain direction. In the real world, we should have sufficient judgement to do something similar without having access to the "true" values of theta.
+
+### Model 2
+
+The `simulate_data()` function already ensure that the thetas are sorted, so it's safe to take the first one and assign it a prior.  
+
+**Note.** We also added a `tau` parameter in order to tweak how strong the prior is without needing to recompile the Stan program.
+
+```{r, comment=""}
+readLines("stan/model2.stan") %>% 
+  writeLines()
+```
+
+```{r, results="hide"}
+model2 <- stan_model("stan/model2.stan")
+```
+
+```{r}
+simulation_data$tau <- 0.5
+```
+
+```{r, results="hide", eval=FALSE}
+fit_sim2 <- sampling(model2, data = simulation_data,
+                     iter = 1000, seed = 123)
+saveRDS(fit_sim2, "output/fit_sim2.rds")
+```
+
+```{r}
+fit_sim2 <- readRDS("output/fit_sim2.rds")
+```
+
+```{r, fig.height=2, fig.width=8, echo=FALSE}
+plot_settings()
+hist(summary(fit_sim2)$summary[ , "Rhat"][1:30], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim2)$summary[ , "Rhat"][31:61], main = "Rhat: alpha",
+     xlab = expression(alpha), breaks = 15)
+
+hist(summary(fit_sim2)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+So this will mean that the chains are still not mixing well. The following plots shows the true value of some parameters, compared with the true value from the simulation (dashed line):
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+bayesplot::mcmc_trace(as.array(fit_sim2), pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+bayesplot::mcmc_trace(as.array(fit_sim2), pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+bayesplot::mcmc_trace(as.array(fit_sim2), pars = "alpha[1]") +
+  geom_hline(yintercept = simulation$pars$alpha[1], 
+             linetype = "dashed", size = 1)
+bayesplot::mcmc_trace(as.array(fit_sim2), pars = "alpha[10]") +
+  geom_hline(yintercept = simulation$pars$alpha[10], 
+             linetype = "dashed", size = 1)
+
+```
+
+This new version of model 2 imposes harsher constraints on the first value of theta (making it *always* negative).
+
+```{r, comment=""}
+readLines("stan/model2b.stan") %>% 
+  writeLines()
+```
+
+```{r}
+model2b <- stan_model("stan/model2b.stan")
+```
+
+```{r, results="hide", eval=FALSE}
+fit_sim2b <- sampling(model2b, data = simulation_data, 
+                      iter = 1000, seed = 123)
+
+saveRDS(fit_sim2b, "output/fit_sim2b.rds")
+```
+
+```{r}
+fit_sim2b <- readRDS("output/fit_sim2b.rds")
+```
+
+```{r, fig.height=2, fig.width=8, echo=FALSE}
+plot_settings()
+hist(summary(fit_sim2b)$summary[ , "Rhat"][1:30], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim2b)$summary[ , "Rhat"][31:61], main = "Rhat: alpha",
+     xlab = expression(alpha), breaks = 15)
+
+hist(summary(fit_sim2b)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+
+## Chains
+mcmc_trace(as.array(fit_sim2b), pars = "theta_1") +
+  geom_hline(yintercept = simulation$pars$theta[1], linetype = "dashed")
+
+mcmc_trace(as.array(fit_sim2b), pars = "theta_rest[1]") +
+  geom_hline(yintercept = simulation$pars$theta[2], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2b), pars = "theta_rest[15]") +
+  geom_hline(yintercept = simulation$pars$theta[16], 
+             linetype = "dashed", size = 1)
+
+```
+
+What's going on here? Probably, when the person we nudge to be on the left isn't far enough on the left, some chains might get stuck on the zero value, and this doesn't provide information for the estimation of the other parameters. We thought that by truncating $\theta_1$ at zero we were placing more density exactly at zero, but this doesn't seem to be the case.
+
+```{r, results="hide"}
+expose_stan_functions("stan/normal_trunc_dgp.stan") 
+sim_y <- replicate(1e4, normal_ub_rng(-1, 1, 0))
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+plot_settings()
+hist(sim_y, breaks = 30, main = "truncated normal, with mean = -1",
+     xlim = c(-5, 1), probability = TRUE)
+curve(dnorm(x, -1, 1), add = TRUE, lty = "dashed", col = "skyblue", 
+      lwd = 3)
+```
+
+****
+
+### `init` trick
+
+****
+
+**First try**
+
+****
+
+This model takes the initial values for theta from a uniform distribution from -1 to 1, following roughly the order of the true values of theta.
+
+```{r}
+theta_inits <- rep(list(list(theta = sort(runif(K, -1, 1)))), 4)
+```
+
+```{r, results="hide", eval=FALSE}
+fit_sim2_init <- sampling(model2, data = simulation_data, 
+                          iter = 1000, seed = 123, 
+                          init = theta_inits,
+                          control = list(max_treedepth = 15))
+saveRDS(fit_sim2_init, "output/fit_sim2_init.rds")
+```
+
+```{r}
+fit_sim2_init <- readRDS("output/fit_sim2_init.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim2_init), pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2_init), pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2_init), pars = "theta[20]") +
+  geom_hline(yintercept = simulation$pars$theta[20], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2_init), pars = "alpha[5]") +
+  geom_hline(yintercept = simulation$pars$alpha[5], 
+             linetype = "dashed", size = 1)
+```
+
+```{r, fig.height=2, fig.width=8, echo=FALSE}
+plot_settings()
+hist(summary(fit_sim2_init)$summary[ , "Rhat"][1:30], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim2_init)$summary[ , "Rhat"][31:61], main = "Rhat: alpha",
+     xlab = expression(alpha), breaks = 15)
+
+hist(summary(fit_sim2_init)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+****
+
+**Second try**
+
+****
+
+Okay, so this "pick your best initial value" strategy works well, but at the same time it seems *too ad hoc*. Furthermore, in the real world we don't know the true values of $\boldsymbol \theta$, so there's no way to actually use this.
+
+The next fit follows Barberá's lead and takes initial values in accordance to each politician's party:
+
+```{r}
+theta_inits2 <- rep(list(list(
+  theta = rnorm(K, mean = ifelse(simulation$party == "B", -1, 1)))), 
+  4)
+```
+
+```{r, results="hide", eval=FALSE}
+fit_sim2_initb <- sampling(model2, data = simulation_data, 
+                          iter = 1000, seed = 123,
+                          init = theta_inits2,
+                          control = list(max_treedepth = 15))
+saveRDS(fit_sim2_initb, "output/fit_sim2_initb.rds")
+```
+
+```{r}
+fit_sim2_initb <- readRDS("output/fit_sim2_initb.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim2_initb), 
+                      pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2_initb), 
+                      pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2_initb), 
+                      pars = "theta[16]") +
+  geom_hline(yintercept = simulation$pars$theta[16], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim2_initb), 
+                      pars = "alpha[5]") +
+  geom_hline(yintercept = simulation$pars$alpha[5], 
+             linetype = "dashed", size = 1)
+```
+
+```{r, fig.height=2, fig.width=8, echo=FALSE}
+plot_settings()
+hist(summary(fit_sim2_initb)$summary[ , "Rhat"][1:30], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim2_initb)$summary[ , "Rhat"][31:61], main = "Rhat: alpha",
+     xlab = expression(alpha), breaks = 15)
+
+hist(summary(fit_sim2_initb)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+****
+
+**Third try**
+
+****
+
+Finally, the next initialization (for `model2b`) only takes an initial value for a "renowned extreme value" person in the dataset:
+
+```{r}
+theta_inits3 <- replicate(4, list(list(theta_1 = rnorm(1, -1, 0.2))))
+```
+
+```{r, results="hide", eval=FALSE}
+fit_sim2b_init <- sampling(model2b, data = simulation_data, 
+                           iter = 1000, seed = 123,
+                           init = theta_inits3,
+                           control = list(max_treedepth = 15))
+saveRDS(fit_sim2b_init, "output/fit_sim2b_init.rds")
+```
+
+```{r}
+fit_sim2b_init <- readRDS("output/fit_sim2b_init.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+## Chain plots
+bayesplot::mcmc_trace(as.array(fit_sim2b_init), 
+                      pars = "theta_1") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+bayesplot::mcmc_trace(as.array(fit_sim2b_init), 
+                      pars = "theta_rest[5]") +
+  geom_hline(yintercept = simulation$pars$theta[6], 
+             linetype = "dashed", size = 1)
+
+bayesplot::mcmc_trace(as.array(fit_sim2b_init), 
+                      pars = "theta_rest[10]") +
+  geom_hline(yintercept = simulation$pars$theta[11], 
+             linetype = "dashed", size = 1)
+
+## Diagnostic plots
+plot_settings()
+hist(summary(fit_sim2b_init)$summary[ , "Rhat"][1:30], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim2b_init)$summary[ , "Rhat"][31:61], main = "Rhat: alpha",
+     xlab = expression(alpha), breaks = 15)
+
+hist(summary(fit_sim2b_init)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+****
+
+### Model 3
+
+**Assume popularity is _known_ and measured by $\textsf{diag}(\mathbf A)$**
+
+We already know that the popularity parameters should be proportional to the popularity parameters. Thus, it's reasonable to include this additional information in the model.
+
+$$
+\boldsymbol \alpha \propto \textsf{diag}(\mathbf A)
+$$
+
+A reasonable solution is as follows:
+
+$$
+\begin{align}
+&x_i = \textsf{diag}(\mathbf A)_i \\\\
+&z_i = \frac{x_i - \bar x}{\textsf{sd}(x)} \\\\
+&w_{ij} \sim \textsf{binomial}(\min(n_i, n_j), p_{ij}) \\\\
+&p_{ij} = \textsf{logit}^{-1}(\beta(z_i + z_j) - \textsf{dist}(\theta_i, \theta_j))
+\end{align}
+$$
+
+In words: we replace the $\boldsymbol \alpha$ parameters with the scaled down amount of total followers, and add a $\beta$ parameter. The reason to do this is that putting the $x$ values directly would mean very low levels of $\beta$ and that probably cause "underflow" in the Stan program. Note that this reduces the amount of parameters Stan has to estimate by half.
+
+Also note the new `transformed data` block in this model, which should make things easier for the rest of models.
+
+```{r, comment=""}
+readLines("stan/model3.stan") %>% 
+  writeLines()
+```
+
+```{r}
+simulation_data2 <- list(
+  N = choose(K, 2),
+  K = K,
+  ii = sim_long$ii,
+  jj = sim_long$jj,
+  W = sim_long$W,
+  D = diag(simulation$A),
+  tau = 0.5
+)
+```
+
+```{r, results="hide", eval=FALSE}
+model3 <- stan_model("stan/model3.stan")
+
+fit_sim3 <- sampling(model3, data = simulation_data2, 
+                     seed = 123, iter = 1000,
+                     control = list(max_treedepth = 15,
+                                    adapt_delta = 0.9)
+                     )
+saveRDS(fit_sim3, "output/fit_sim3.rds")
+```
+
+```{r}
+fit_sim3 <- readRDS("output/fit_sim3.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim3), 
+                      pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3), 
+                      pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3), 
+                      pars = "theta[5]") +
+  geom_hline(yintercept = simulation$pars$theta[5], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3), pars = c("alpha", "beta"))
+
+## Diagnostic plots
+plot_settings()
+hist(summary(fit_sim3)$summary[ , "Rhat"][1:20], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim3)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+This model didn't fit well.
+
+In the next fit we do the same thing, but use clever initialization values.
+
+```{r, results="hide", eval=FALSE}
+fit_sim3b <- sampling(model3, data = simulation_data2, 
+                     seed = 123, iter = 2000,
+                     control = list(max_treedepth = 15,
+                                    adapt_delta = 0.9),
+                     init = theta_inits2
+                     )
+
+
+saveRDS(fit_sim3b, "output/fit_sim3b.rds")
+```
+
+```{r}
+fit_sim3b <- readRDS("output/fit_sim3b.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim3b), pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3b), pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3b), pars = "theta[5]") +
+  geom_hline(yintercept = simulation$pars$theta[5], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3b), pars = c("alpha", "beta"))
+
+plot_settings()
+hist(summary(fit_sim3b)$summary[ , "Rhat"][1:20], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim3b)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+```{r, comment=""}
+print(fit_sim3b, pars = "theta", probs = c(0.25, 0.5, 0.75))
+```
+
+This one fits much better, but it's still not good!
+
+**Model 3b** This one doesn't standardize the data, but rather takes the log of total followers. Here, the intercept coefficient *should* be negative.
+
+$$
+\begin{align}
+&x_i = \textsf{diag}(\mathbf A)_i \\\\
+&w_{ij} \sim \textsf{binomial}(\min(n_i, n_j), p_{ij}) \\\\
+&p_{ij} = \textsf{logit}^{-1}(\alpha + \beta\log(x_i + x_j) - \textsf{dist}(\theta_i, \theta_j))
+\end{align}
+$$
+
+```{r, comment=""}
+readLines("stan/model3b.stan") %>% 
+  writeLines()
+```
+
+```{r, results="hide", eval=FALSE}
+model3b <- stan_model("stan/model3b.stan")
+
+fit_sim3log <- sampling(model3b, data = simulation_data2, 
+                        seed = 123, iter = 1000,
+                        control = list(max_treedepth = 15,
+                                       adapt_delta = 0.95),
+                        init = theta_inits2
+                        )
+
+
+saveRDS(fit_sim3log, "output/fit_sim3log.rds")
+```
+
+```{r}
+fit_sim3log <- readRDS("output/fit_sim3log.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim3log), pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3log), pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3log), pars = "theta[5]") +
+  geom_hline(yintercept = simulation$pars$theta[5], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim3log), pars = c("alpha", "beta"))
+
+plot_settings()
+hist(summary(fit_sim3log)$summary[ , "Rhat"][1:20], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim3log)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+```{r, comment=""}
+print(fit_sim3log, pars = "theta", probs = c(0.25, 0.5, 0.75))
+```
+
+### Model 4
+
+In this final model, we enforce an ordering of the "ideology population means", such that $\mu_A < \mu_B$. This follows Betancourt's solution to identifiability in the section of his case study titled "Breaking the Labeling Degeneracy by Enforcing an Ordering".
+
+Note that we're not only ordering the population means, but that we're also giving them assymetric priors; and that we also give assymetric priors to two $\theta_i$ parameters.
+
+```{r, comment=""}
+pindex <- ifelse(simulation$party == "B", 1, 2)
+simulation_data2$pindex <- pindex
+
+readLines("stan/model4.stan") %>% 
+  writeLines()
+```
+
+In math:
+
+$$
+\begin{align}
+&x_i = \textsf{diag}(\mathbf A)_i \\\\
+&w_{ij} \sim \textsf{binomial}(\min(n_i, n_j), p_{ij}) \\\\
+&p_{ij} = \textsf{logit}^{-1}(\alpha + \beta\log(x_i + x_j) - \textsf{dist}(\theta_i, \theta_j))
+\end{align}
+$$
+
+```{r, results="hide", eval=FALSE}
+model4 <- stan_model("stan/model4.stan")
+fit_sim4 <- sampling(model4, data = simulation_data2,
+                 seed = 123, iter = 2000,
+                 control = list(max_treedepth = 15,
+                                adapt_delta = 0.95),
+                 init = theta_inits2)
+saveRDS(fit_sim4, "output/fit_sim4.rds")
+```
+
+```{r}
+fit_sim4 <- readRDS("output/fit_sim4.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+mcmc_trace(as.array(fit_sim4), pars = "theta[1]") +
+  geom_hline(yintercept = simulation$pars$theta[1], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim4), pars = "theta[10]") +
+  geom_hline(yintercept = simulation$pars$theta[10], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim4), pars = "theta[16]") +
+  geom_hline(yintercept = simulation$pars$theta[16], 
+             linetype = "dashed", size = 1)
+
+mcmc_trace(as.array(fit_sim4), pars = c("alpha", "beta"))
+
+plot_settings()
+hist(summary(fit_sim4)$summary[ , "Rhat"][1:20], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit_sim4)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+### Conclusion
+
+Overall, model 3 and model 4 did better than the rest, which is not surprising given that they have the most bells and whistles (including a clever initialization strategy for the $\theta$s). The difference between them is that model 4 includes information on party identification, and so in theory should perform better.
+
+**Assessing parameter recovery**
+
+```{r}
+draws <- extract(fit_sim4)$theta
+colnames(draws) <- paste0("theta[", 1:20, "]")
+```
+
+Roughly half the 50% intervals (95% of the 95% intervals) *should* contain the true parameter values, given that we have simulated data from the model we are fitting. However, keep in mind that because we only have 20 ideology parameters, the percentages might be a bit off.
+
+```{r}
+between <- function(x, min, max) {
+  return(x > min & x < max)
+}
+
+interval_95 <- apply(draws, MARGIN = 2, quantile, 
+                     prob = c(0.025, 0.975)) 
+
+between(simulation$pars$theta, min = interval_95[1, ],
+                    max = interval_95[2, ]) %>% 
+  mean()
+
+interval_50 <- apply(draws, MARGIN = 2, quantile, 
+                     prob = c(0.25, 0.75)) 
+
+between(simulation$pars$theta, min = interval_50[1, ],
+                    max = interval_50[2, ]) %>% 
+  mean()
+```
+
+So $\frac{16}{20}$ parameters are contained in the 95% intervals, and $\frac{12}{20}$ parameters are contained in the 50% intevals. The following plot shows a more complete assessment of parameter recovery
+
+```{r, fig.height=8, fig.width=5, echo=FALSE}
+draws <- as_data_frame(draws) %>% 
+  gather(key = "theta", value = "sample", factor_key = TRUE)
+
+prob <- c(0.025, 0.25, 0.5, 0.75, 0.975)
+
+draws <- draws %>% 
+  group_by(theta) %>% 
+  summarize(quantiles = list(quantile(sample, prob)),
+            post_mean = mean(sample)) %>% 
+  mutate("2.5%"  = map_dbl(quantiles, ~.[1]),
+         "25%"   = map_dbl(quantiles, ~.[2]),
+         "50%"   = map_dbl(quantiles, ~.[3]),
+         "75%"   = map_dbl(quantiles, ~.[4]),
+         "97.5%" = map_dbl(quantiles, ~.[5])
+         )
+
+draws$true_theta <- simulation$pars$theta
+Rhat <- round(summary(fit_sim4)$summary[ , "Rhat"][1:20], 2)
+
+ggplot(draws, aes(y = theta)) +
+  geom_errorbarh(aes(xmax = `75%`, xmin = `25%`), 
+                 size = 2, alpha = 0.5, height = 0) +
+  geom_errorbarh(aes(xmax = `97.5%`, xmin = `2.5%`), 
+                 size = 1, alpha = 0.5, height = 0) +
+  geom_point(aes(x = true_theta), color = "tomato", size = 2) +
+  labs(y = NULL, x = NULL) +
+  theme_minimal(base_family = "Avenir") +
+  annotate("text", x = -5.5, y = 1:20, 
+           label = paste("Rhat =", Rhat), 
+           hjust = 0,
+           size = 3) +
+  labs(title = "Assesing parameter recovery")
+```
+
+Note that some of the intervals in the above graph are the product of chains that didn't mixed very well, particulary for `theta[6]`.
+
+
+
+****
+
+## Discussion
+
+**What are the strengths and weaknesses of the model. How might the model be expanded?**
+
+****
+
+Overall, we found that this type of model is extremely fragile and that it's not easy to predict when it will fit and when it won't. This is a major drawback. To solve this, we were forced to make many "clever" decisions which make reproducibility suspect.
+
+****
+
+*Please note that all previous four models are already expansions of the original model.*
+
+****
+
+In what follows, we propose four ways to expand the model:
+
+**A different distance function.** It's very common for social network models to work with the Euclidean distance:
+
+$$
+\text{(Euclidean) }\textsf{dist}(\theta_{i}, \theta_{j}) = \left[\sum_d (\theta_{id} - \theta_{jd})^2 \right]^{\frac{1}{2}}
+$$
+
+Here, $d$ represents the amount of dimensions we could add, but because we only consider $d = 1$, the sum drops out. However, we don't necessarily have to use this type of distance. We can use any other distance metric, as long as it obeys the triangle inequality and that $f$ is some monotone function.
+
+$$
+\textsf{dist}(\theta_{i}, \theta_{j}) = f\left(\left[\sum_d (\theta_{id} - \theta_{jd})^2 \right]^{\frac{1}{2}}\right)
+$$
+
+In fact, Barberá already uses a different distance:
+
+$$
+\text{(Barberá's) } \textsf{dist}(\theta_i, \theta_j) = \gamma (\theta_i - \theta_j)^2
+$$
+    
+**Footnote:** Why did he do this? Probably because the `abs` and `fabs` functions in Stan "*can seriously hinder sampling and optimization efficiency for gradient-based methods (e.g., NUTS, HMC, BFGS) if applied to parameters (including transformed parameters and local variables in the transformed parameters or model block). The problem is that they break gradients due to discontinuities coupled with zero gradients elsewhere. They do not hinder sampling when used in the data, transformed data, or generated quantities blocks*" (Stan Manual, p. 436). 
+
+The reason for wanting to change the distance function is because when $\textsf{dist}(\theta_i, \theta_j)$ approaches zero, the probability inside the binomial likelihood is not increasing. That is, $\textsf{dist}(\theta_i, \theta_j)$ only has the effect of taking away from  $p$ when the distance is large, but it never adds to it.
+
+**Adjust for geography**. Presumably, the "following behavior" of Twitter users follows a geographical pattern (i.e. the closer these politicians are to your home, the more likely you are to follow them, even if you don't like them at all). If geographic distance is not orthogonal to ideology, then the ideal point estimates might be biased in systematic ways. Thus we can add an extra extra indicator variable $g$ as follows:
+
+$$
+\begin{align}
+&p_{ij} = \textsf{logit}^{-1}(\alpha + \psi g_{ij} + \beta\log(x_i + x_j) - \textsf{dist}(\theta_i, \theta_j)) \\\\
+&g_{ij} = \begin{cases}
+  1 &\text{if } i \text{ and } j \text{ are in same region} \\
+  0 &\text{otherwise}
+\end{cases}
+\end{align}
+$$
+
+**Treat $n$ as a random variable**. All elements in $\textsf{diag}(\mathbf A)$ (i.e. the $n$ in the binomial likelihood) could be treated as a random variable. The reason for this is simple:
+
+i. The $n$ values come from a sample of Twitter users. Barberá removed many users located outside the USA, as well as others that don't seem to be active in the las couple of years. In other words, we *could* have observed a different $n$.
+
+ii. Even if we change the $n$ values to include *all* followers, the amount of followers today (and thus, also mutual followers) might not be the same tomorrow.
+
+We are thinking that a model like this:
+
+$$
+\begin{align}
+&w_{ij} \sim \textsf{poisson}(\lambda_{ij}) \\\\
+&\lambda_{ij} = \exp(\alpha + \beta\log(x_i + x_j) - \textsf{dist}(\theta_i, \theta_j)) \\\\
+&x_i = \textsf{diag}(\mathbf A)_i
+\end{align}
+$$
+
+Or *maybe* like this:
+
+$$
+\begin{align}
+&\lambda_{ij} \sim \textsf{mvnormal}(0, \boldsymbol \Omega) \\\\
+&\rho_{ij}  \text{ is modeled as a function of } \textsf{diag}(\mathbf A) \text{ and } \textsf{dist}(\theta_i, \theta_j) \\\\
+\end{align}
+$$
+
+Or perhaps it will make more sense to model $w_{ij}$ as if it came from a negative binomial distribution, where $\textsf{dist}(\theta_i, \theta_j)$ affects the mean, and $\textsf{diag}(\mathbf A)$ affects the overdispersion of the data.
+
+****
+
+## Fit to real data
+
+****
+
+**Fit the model to the real data and perform model checking and/or validation (Chapters 6 and 7 of BDA).**
+
+**Note**. None of the models actually fit to the real data. 
+
+****
+
+**The data**
+
+```{r}
+load("data/barberá_replication_set/adj-matrix-US.rdata")
+load("data/barberá_replication_set/elites-data.Rdata")
+us <- elites.data[["US"]]; rm(elites.data)
+```
+
+Getting the data into "long form" (with Bernie Sanders being the first and Marco Rubio bein the last on the list):
+
+```{r}
+A <- t(y) %*% y
+name_index <- colnames(y)
+s <- which(name_index %in% c("marcorubio", "SenSanders"))
+
+A <- A[c("SenSanders", name_index[-s], "marcorubio"),
+       c("SenSanders", name_index[-s], "marcorubio")]
+
+as_long_form <- function(M) {
+  N <- sum(upper.tri(M, diag = FALSE))
+  output <- matrix(NA, ncol = 3, nrow = N)
+  k <- 1
+  for (i in 1:(ncol(M) - 1)) {
+    for (j in (i + 1):ncol(M)) {
+      output[k, 1:2] <- c(i, j)
+      output[k, 3] <- M[i, j]
+      k <- k + 1
+    }
+  }
+  colnames(output) <- c("ii", "jj", "W")
+  return(output)
+}
+
+df <- as_long_form(A) %>% as_tibble()
+df$name_ii <- colnames(A)[df$ii]
+df$name_jj <- colnames(A)[df$jj]
+
+stan_data <- list(
+  N = nrow(df),
+  K = ncol(A),
+  ii = df$ii,
+  jj = df$jj,
+  W = df$W,
+  D = diag(A),
+  tau = 0.5
+  )
+
+df
+```
+
+```{r}
+df_senators <- data_frame(screen_name = colnames(A),
+                          total_followers = diag(A)) %>% 
+  left_join(us %>% filter(!duplicated(screen_name))) %>% 
+  select(screen_name, total_followers, location, party)
+
+df_senators <- df_senators %>% 
+  mutate(init = case_when(
+    screen_name == "SenSanders" ~ -1,
+    party == "R" ~ 1,
+    party == "D" ~ -1,
+    TRUE         ~ 0
+  ))
+
+theta_initial <- rep(list(list(
+  theta = rnorm(318, df_senators$init, 0.05))), 4)
+
+pindex <- case_when(
+  df_senators$party == "D" ~ 1,
+  df_senators$party == "R" ~ 3,
+  TRUE ~ 2
+)
+stan_data$pindex <- pindex
+```
+
+### Stan 1
+
+```{r, comment=""}
+readLines("stan/model3b.stan") %>% 
+  writeLines()
+```
+
+```{r, results="hide", eval=FALSE}
+model <- stan_model("stan/model3b.stan")
+
+## change iter and warmup in final fit
+fit <- sampling(model, data = stan_data,
+                seed = 123, iter = 500, warmup = 250,
+                control = list(max_treedepth = 15,
+                               adapt_delta = 0.95),
+                init = theta_initial)
+
+saveRDS(fit, "output/fit.rds")
+```
+
+```{r}
+fit <- readRDS("output/fit.rds")
+```
+
+The model doesn't actually fit this data, as shown by the `Rhat`s and the `n_eff`s:
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+plot_settings()
+hist(summary(fit)$summary[ , "Rhat"][1:318], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
+### Stan 2
+
+```{r}
+readLines("stan/model4b.stan") %>% 
+  writeLines()
+```
+
+```{r, results="hide", eval=FALSE}
+model2 <- stan_model("stan/model4b.stan")
+
+## change iter and warmup in final fit
+fit2 <- sampling(model2, data = stan_data, 
+                 seed = 123, iter = 1000,
+                 control = list(max_treedepth = 15,
+                                adapt_delta = 0.95),
+                init = theta_initial)
+
+saveRDS(fit2, "output/fit2.rds")
+```
+
+```{r}
+fit2 <- readRDS("output/fit_real.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE}
+plot_settings()
+hist(summary(fit2)$summary[ , "Rhat"][1:318], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit2)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+
+mcmc_trace(as.array(fit), pars = c("alpha", "beta"))
+
+mcmc_trace(as.array(fit2), 
+           pars = c("theta[1]", "theta[10]"))
+
+mcmc_trace(as.array(fit2), 
+           pars = c("theta[200]", "theta[300]"))
+```
+
+How long did this take to fit?
+
+```{r}
+get_elapsed_time(fit2) 
+```
+
+### new `init` trick
+
+Give each politician an initialization value drawn from a uniform distribution between -1 and 1, but in accordance to their first principal component.
+
+```{r}
+pca <- prcomp(A, scale = TRUE, center = TRUE)
+init_df <- data_frame(init_pca = sort(runif(318, -1, 1), FALSE),
+                      pc1 = sort(pca$rotation[ , 1], TRUE),
+            screen_name = names(sort(pca$rotation[ , 1]*-1)))
+
+df_senators <- df_senators %>% 
+  full_join(init_df)
+
+theta_initial_pca <- rep(list(list(
+  theta = df_senators$init_pca)), 4)
+```
+
+```{r, eval=FALSE}
+fit2pca <- sampling(model2, data = stan_data, 
+                     seed = 123, iter = 500,
+                     control = list(max_treedepth = 15,
+                                    adapt_delta = 0.95),
+                     init = theta_initial_pca)
+
+saveRDS(fit2pca, "output/fit2pca.rds")
+```
+
+```{r, eval=FALSE}
+fit2pca <- readRDS("output/fit2pca.rds")
+```
+
+```{r, fig.width=8, fig.height=2, echo=FALSE, eval=FALSE}
+plot_settings()
+hist(summary(fit2)$summary[ , "Rhat"][1:318], main = "Rhat: theta",
+     xlab = expression(theta), breaks = 15)
+
+hist(summary(fit2)$summary[ , "n_eff"], main = "n_eff",
+     xlab = expression(alpha), breaks = 30)
+```
+
